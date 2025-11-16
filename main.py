@@ -1,4 +1,4 @@
-import hashlib
+import bcrypt
 import os
 from typing import List, Optional
 
@@ -179,18 +179,14 @@ def login(
 ) -> LoginResponse:
     """
     Authenticates user and returns userId and companyId.
-    Checks users table for matching email and password_hash.
+    Checks users table for matching email and verifies password using bcrypt.
     """
 
-    # Hash password (simple SHA256 for now - in production use bcrypt)
-    password_hash = hashlib.sha256(payload.password.encode()).hexdigest()
-
-    # Find user by email and password_hash
+    # Find user by email
     user_result = (
         supabase.table("users")
         .select("*")
         .eq("email", payload.email)
-        .eq("password_hash", password_hash)
         .maybe_single()
         .execute()
     )
@@ -198,6 +194,36 @@ def login(
     user_data: Optional[dict] = getattr(user_result, "data", None)
 
     if not user_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    # Get stored password hash
+    stored_password_hash = user_data.get("password_hash")
+
+    if not stored_password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User account has no password set.",
+        )
+
+    # Verify password using bcrypt
+    # Handle both bytes and string stored hashes
+    if isinstance(stored_password_hash, str):
+        stored_password_hash = stored_password_hash.encode("utf-8")
+
+    try:
+        password_valid = bcrypt.checkpw(
+            payload.password.encode("utf-8"), stored_password_hash
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error verifying password.",
+        )
+
+    if not password_valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -216,10 +242,8 @@ def signup(
     """
     Creates a new user and company.
     First creates company, then creates user linked to that company.
+    Uses bcrypt to hash passwords securely.
     """
-
-    # Hash password (simple SHA256 for now - in production use bcrypt)
-    password_hash = hashlib.sha256(payload.password.encode()).hexdigest()
 
     # Check if email already exists
     existing_user = (
@@ -235,6 +259,12 @@ def signup(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered.",
         )
+
+    # Hash password using bcrypt
+    salt = bcrypt.gensalt()
+    password_hash = bcrypt.hashpw(payload.password.encode("utf-8"), salt)
+    # Store as string (bcrypt hash is safe to store as string)
+    password_hash_str = password_hash.decode("utf-8")
 
     # Create company
     company_result = (
@@ -262,26 +292,37 @@ def signup(
     company_id = company_data[0].get("id")
 
     # Create user linked to company
-    user_result = (
-        supabase.table("users")
-        .insert(
-            {
-                "email": payload.email,
-                "password_hash": password_hash,
-                "company_id": company_id,
-            }
+    try:
+        user_result = (
+            supabase.table("users")
+            .insert(
+                {
+                    "email": payload.email,
+                    "password_hash": password_hash_str,
+                    "company_id": company_id,
+                }
+            )
+            .select()
+            .execute()
         )
-        .select()
-        .execute()
-    )
 
-    user_data: Optional[List[dict]] = getattr(user_result, "data", None)
+        user_data: Optional[List[dict]] = getattr(user_result, "data", None)
 
-    if not user_data or len(user_data) == 0:
-        # Company was created but user creation failed - could clean up company here
+        if not user_data or len(user_data) == 0:
+            # Company was created but user creation failed - could clean up company here
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user.",
+            )
+    except Exception as e:
+        # If user creation fails, try to clean up the company
+        try:
+            supabase.table("companies").delete().eq("id", company_id).execute()
+        except:
+            pass  # Best effort cleanup
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create user.",
+            detail=f"Failed to create user: {str(e)}",
         )
 
     user_id = str(user_data[0].get("id"))
