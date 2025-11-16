@@ -1,3 +1,4 @@
+import hashlib
 import os
 from typing import List, Optional
 
@@ -6,13 +7,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client
 
 from models import (
-    AuthResponse,
-    DashboardMetrics,
-    DashboardResponse,
+    CompanyResponse,
+    DashboardCompanyResponse,
     LoginRequest,
+    LoginResponse,
     SettingsResponse,
     SettingsUpdateRequest,
     SignupRequest,
+    SignupResponse,
 )
 from supabase_client import get_supabase
 
@@ -21,9 +23,16 @@ FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
 app = FastAPI(title="B2B SaaS Backend", version="1.0.0")
 
+# Allow multiple origins for Vercel deployment
+allowed_origins = [
+    FRONTEND_ORIGIN,
+    "http://localhost:3000",
+    "https://*.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=["*"],  # Allow all origins for now, can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,56 +44,66 @@ def root() -> dict:
     return {"message": "Backend running!"}
 
 
-@app.get("/dashboard/{company_id}", response_model=DashboardResponse)
+@app.get("/dashboard/{company_id}", response_model=DashboardCompanyResponse)
 def get_dashboard(
     company_id: str, supabase: Client = Depends(get_supabase)
-) -> DashboardResponse:
+) -> DashboardCompanyResponse:
     """
     Returns dashboard data for a given company.
-    Expects a `dashboard_metrics` table in Supabase with columns:
-    company_id, total_revenue, total_customers, active_subscriptions.
+    Fetches company from companies table and dashboard_data if exists.
     """
 
-    result = (
-        supabase.table("dashboard_metrics")
+    # Fetch company
+    company_result = (
+        supabase.table("companies")
         .select("*")
-        .eq("company_id", company_id)
+        .eq("id", int(company_id))
         .maybe_single()
         .execute()
     )
 
-    data: Optional[dict] = getattr(result, "data", None)
+    company_data: Optional[dict] = getattr(company_result, "data", None)
 
-    if not data:
-        # Return an empty but well-typed response if no data exists yet
-        return DashboardResponse(
-            company_id=company_id,
-            metrics=DashboardMetrics(),
+    if not company_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company with ID {company_id} not found.",
         )
 
-    metrics = DashboardMetrics(
-        total_revenue=data.get("total_revenue"),
-        total_customers=data.get("total_customers"),
-        active_subscriptions=data.get("active_subscriptions"),
+    # Fetch dashboard data if exists (most recent first)
+    dashboard_result = (
+        supabase.table("dashboard_data")
+        .select("*")
+        .eq("company_id", int(company_id))
+        .order("created_at", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
     )
 
-    return DashboardResponse(company_id=company_id, metrics=metrics)
+    dashboard_data: Optional[dict] = getattr(dashboard_result, "data", None)
+    data_json = dashboard_data.get("data_json") if dashboard_data else None
+
+    return DashboardCompanyResponse(
+        company_id=company_id,
+        name=company_data.get("name", ""),
+        data=data_json if data_json else None,
+    )
 
 
-@app.get("/settings/{company_id}", response_model=SettingsResponse)
+@app.get("/settings/{company_id}", response_model=CompanyResponse)
 def get_settings(
     company_id: str, supabase: Client = Depends(get_supabase)
-) -> SettingsResponse:
+) -> CompanyResponse:
     """
-    Returns Shopify credentials for a company.
-    Expects a `company_settings` table in Supabase with columns:
-    company_id, shopify_shop_domain, shopify_access_token, shopify_api_key, shopify_api_secret.
+    Returns company settings including Shopify credentials.
+    Reads from companies table which contains shopify_domain, api_key, access_token.
     """
 
     result = (
-        supabase.table("company_settings")
+        supabase.table("companies")
         .select("*")
-        .eq("company_id", company_id)
+        .eq("id", int(company_id))
         .maybe_single()
         .execute()
     )
@@ -92,68 +111,179 @@ def get_settings(
     data: Optional[dict] = getattr(result, "data", None)
 
     if not data:
-        return SettingsResponse(company_id=company_id, shopify=None)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company with ID {company_id} not found.",
+        )
 
-    shopify = {
-        "shop_domain": data.get("shopify_shop_domain"),
-        "access_token": data.get("shopify_access_token"),
-        "api_key": data.get("shopify_api_key"),
-        "api_secret": data.get("shopify_api_secret"),
-    }
+    return CompanyResponse(
+        id=data.get("id"),
+        name=data.get("name", ""),
+        shopify_domain=data.get("shopify_domain"),
+        api_key=data.get("api_key"),
+        access_token=data.get("access_token"),
+        created_at=data.get("created_at", ""),
+    )
 
-    return SettingsResponse(company_id=company_id, shopify=shopify)
 
-
-@app.post("/settings/{company_id}", response_model=SettingsResponse)
+@app.post("/settings/{company_id}", response_model=CompanyResponse)
 def update_settings(
     company_id: str,
     payload: SettingsUpdateRequest,
     supabase: Client = Depends(get_supabase),
-) -> SettingsResponse:
+) -> CompanyResponse:
     """
     Updates Shopify credentials for a company.
-    Uses an upsert into the `company_settings` table.
+    Updates the companies table with shopify_domain, api_key, access_token.
     """
 
     shopify = payload.shopify
 
-    row = {
-        "company_id": company_id,
-        "shopify_shop_domain": shopify.shop_domain,
-        "shopify_access_token": shopify.access_token,
-        "shopify_api_key": shopify.api_key,
-        "shopify_api_secret": shopify.api_secret,
+    update_data = {
+        "shopify_domain": shopify.shop_domain,
+        "api_key": shopify.api_key,
+        "access_token": shopify.access_token,
     }
 
-    result = supabase.table("company_settings").upsert(row).execute()
+    result = (
+        supabase.table("companies")
+        .update(update_data)
+        .eq("id", int(company_id))
+        .select()
+        .execute()
+    )
 
-    # Use the sent data as the source of truth for the response
-    if not getattr(result, "data", None):
+    updated_data: Optional[List[dict]] = getattr(result, "data", None)
+
+    if not updated_data or len(updated_data) == 0:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update settings.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Company with ID {company_id} not found.",
         )
 
-    return SettingsResponse(company_id=company_id, shopify=shopify)
+    company = updated_data[0]
+
+    return CompanyResponse(
+        id=company.get("id"),
+        name=company.get("name", ""),
+        shopify_domain=company.get("shopify_domain"),
+        api_key=company.get("api_key"),
+        access_token=company.get("access_token"),
+        created_at=company.get("created_at", ""),
+    )
 
 
-@app.post("/auth/login", response_model=AuthResponse)
-def login(payload: LoginRequest) -> AuthResponse:
+@app.post("/auth/login", response_model=LoginResponse)
+def login(
+    payload: LoginRequest, supabase: Client = Depends(get_supabase)
+) -> LoginResponse:
     """
-    Placeholder login endpoint.
-    Wire this up later to Supabase Auth or your own auth logic.
+    Authenticates user and returns userId and companyId.
+    Checks users table for matching email and password_hash.
     """
 
-    # Placeholder behavior: always succeed.
-    return AuthResponse(message="Login successful (placeholder).")
+    # Hash password (simple SHA256 for now - in production use bcrypt)
+    password_hash = hashlib.sha256(payload.password.encode()).hexdigest()
+
+    # Find user by email and password_hash
+    user_result = (
+        supabase.table("users")
+        .select("*")
+        .eq("email", payload.email)
+        .eq("password_hash", password_hash)
+        .maybe_single()
+        .execute()
+    )
+
+    user_data: Optional[dict] = getattr(user_result, "data", None)
+
+    if not user_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    user_id = str(user_data.get("id"))
+    company_id = str(user_data.get("company_id"))
+
+    return LoginResponse(userId=user_id, companyId=company_id)
 
 
-@app.post("/auth/signup", response_model=AuthResponse)
-def signup(payload: SignupRequest) -> AuthResponse:
+@app.post("/auth/signup", response_model=SignupResponse)
+def signup(
+    payload: SignupRequest, supabase: Client = Depends(get_supabase)
+) -> SignupResponse:
     """
-    Placeholder signup endpoint.
-    Wire this up later to Supabase Auth or your own auth logic.
+    Creates a new user and company.
+    First creates company, then creates user linked to that company.
     """
 
-    # Placeholder behavior: always succeed.
-    return AuthResponse(message="Signup successful (placeholder).")
+    # Hash password (simple SHA256 for now - in production use bcrypt)
+    password_hash = hashlib.sha256(payload.password.encode()).hexdigest()
+
+    # Check if email already exists
+    existing_user = (
+        supabase.table("users")
+        .select("id")
+        .eq("email", payload.email)
+        .maybe_single()
+        .execute()
+    )
+
+    if getattr(existing_user, "data", None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered.",
+        )
+
+    # Create company
+    company_result = (
+        supabase.table("companies")
+        .insert(
+            {
+                "name": payload.company_name,
+                "shopify_domain": None,
+                "api_key": None,
+                "access_token": None,
+            }
+        )
+        .select()
+        .execute()
+    )
+
+    company_data: Optional[List[dict]] = getattr(company_result, "data", None)
+
+    if not company_data or len(company_data) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create company.",
+        )
+
+    company_id = company_data[0].get("id")
+
+    # Create user linked to company
+    user_result = (
+        supabase.table("users")
+        .insert(
+            {
+                "email": payload.email,
+                "password_hash": password_hash,
+                "company_id": company_id,
+            }
+        )
+        .select()
+        .execute()
+    )
+
+    user_data: Optional[List[dict]] = getattr(user_result, "data", None)
+
+    if not user_data or len(user_data) == 0:
+        # Company was created but user creation failed - could clean up company here
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user.",
+        )
+
+    user_id = str(user_data[0].get("id"))
+
+    return SignupResponse(userId=user_id, companyId=str(company_id))

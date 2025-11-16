@@ -41,7 +41,35 @@ class SignupRequest(BaseModel):
     company_name: str
 
 
-class AuthResponse(BaseModel):
-    message: str
+class LoginResponse(BaseModel):
+    userId: str
+    companyId: str
+
+
+class SignupResponse(BaseModel):
+    userId: str
+    companyId: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    company_id: int
+    created_at: str
+
+
+class CompanyResponse(BaseModel):
+    id: int
+    name: str
+    shopify_domain: Optional[str] = None
+    api_key: Optional[str] = None
+    access_token: Optional[str] = None
+    created_at: str
+
+
+class DashboardCompanyResponse(BaseModel):
+    company_id: str
+    name: str
+    data: Optional[dict] = None
 
 
